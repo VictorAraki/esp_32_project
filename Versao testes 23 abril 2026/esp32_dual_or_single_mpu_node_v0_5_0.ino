@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <Wire.h>
 
 // =====================================================
@@ -73,22 +72,31 @@ static const uint8_t MPU_ADDR_2 = 0x69; // AD0 no 3.3V
 // Estado por sensor
 // =====================================================
 struct SensorState {
+  // Identidade
   const char *sensor_name;
   const char *sensor_id;
   uint8_t addr;
   bool enabled;
-  bool detected;
-  bool healthy;
-  bool wasHealthy;
-  bool inWarmup;
-  uint8_t warmupDiscardRemaining;
-  uint32_t recoveryStartMs;
-  uint32_t consecutiveFailures;
-  uint32_t totalFailures;
-  uint32_t totalReadsOk;
-  float gxOffsetDps;
-  float gyOffsetDps;
-  float gzOffsetDps;
+
+  // Saúde / presença
+  bool detected = false;
+  bool healthy = false;
+  bool wasHealthy = false;
+
+  // Recovery / warmup
+  bool inWarmup = false;
+  uint8_t warmupDiscardRemaining = 0;
+  uint32_t recoveryStartMs = 0;
+
+  // Contadores
+  uint32_t consecutiveFailures = 0;
+  uint32_t totalFailures = 0;
+  uint32_t totalReadsOk = 0;
+
+  // Offsets de giroscópio, já calibrados
+  float gxOffsetDps = 0.0f;
+  float gyOffsetDps = 0.0f;
+  float gzOffsetDps = 0.0f;
 };
 
 // Offsets de gyro obtidos na sua calibração diagnóstica
