@@ -1,8 +1,9 @@
+#include <Arduino.h>
 #include <Wire.h>
 
 // =====================================================
-// Nó ESP32 + 1 ou 2 MPU6050
-// Versão: 0.5.0
+// Nó ESP32 + 1 ou 2 MPU6050 — padrão técnico de identificação
+// Versão: 0.6.0
 //
 // O que esta versão adiciona:
 // - suporte a 1 ou 2 sensores por configuração
@@ -10,6 +11,7 @@
 // - nó não entra em "degraded" por sensor desabilitado intencionalmente
 // - heartbeat reflete apenas sensores habilitados
 // - health check, recovery, warmup, LED de estado e offset de gyro por sensor
+// - identificação técnica desacoplada da posição anatômica: N01, IMU01, IMU02, stream_id
 //
 // Regras de uso:
 // - para usar 1 sensor: deixe ENABLE_SENSOR_1 = true e ENABLE_SENSOR_2 = false
@@ -21,10 +23,10 @@
 // =====================================================
 // Configuração geral do nó
 // =====================================================
-static const char *NODE_ID = "esp32_arm_01";
+static const char *NODE_ID = "N01";
 static const char *PROTO_VER = "0.1";
 static const char *FW_NAME = "ictaltech_sensor_node";
-static const char *FW_VERSION = "0.5.0";
+static const char *FW_VERSION = "0.6.0";
 
 static const uint8_t I2C_SDA_PIN = 21;
 static const uint8_t I2C_SCL_PIN = 22;
@@ -42,8 +44,8 @@ static const uint8_t WARMUP_SAMPLES_TO_DISCARD = 5;
 // Habilitação de sensores
 // =====================================================
 // Deixe true/false conforme o hardware realmente conectado.
-static const bool ENABLE_SENSOR_1 = true;   // imu_upper_arm  - endereco 0x68
-static const bool ENABLE_SENSOR_2 = true;   // imu_forearm    - endereco 0x69
+static const bool ENABLE_SENSOR_1 = false;  // IMU01 - endereco 0x68
+static const bool ENABLE_SENSOR_2 = true;   // IMU02 - endereco 0x69
 
 // =====================================================
 // LED onboard
@@ -61,6 +63,8 @@ static const uint8_t REG_WHO_AM_I     = 0x75;
 static const uint8_t REG_ACCEL_XOUT_H = 0x3B;
 static const uint8_t REG_GYRO_CONFIG  = 0x1B;
 static const uint8_t REG_ACCEL_CONFIG = 0x1C;
+static const uint8_t REG_SMPLRT_DIV   = 0x19;
+static const uint8_t REG_CONFIG       = 0x1A;
 
 // =====================================================
 // Endereços I2C
@@ -72,37 +76,42 @@ static const uint8_t MPU_ADDR_2 = 0x69; // AD0 no 3.3V
 // Estado por sensor
 // =====================================================
 struct SensorState {
-  // Identidade
-  const char *sensor_name;
-  const char *sensor_id;
-  uint8_t addr;
+  // Identidade técnica
+  // Importante: não usar significado anatômico aqui.
+  // Ex.: posição no corpo deve ser mapeada no backend:
+  // N01_IMU01 -> upper_arm/right, N01_IMU02 -> forearm/right etc.
+  const char *sensor_model;  // ex.: "mpu6050"
+  const char *sensor_type;   // ex.: "IMU"
+  const char *sensor_id;     // ex.: "IMU01"
+  uint8_t addr;              // endereço físico I2C, não usar como ID principal
   bool enabled;
 
   // Saúde / presença
-  bool detected = false;
-  bool healthy = false;
-  bool wasHealthy = false;
+  bool detected;
+  bool healthy;
+  bool wasHealthy;
 
   // Recovery / warmup
-  bool inWarmup = false;
-  uint8_t warmupDiscardRemaining = 0;
-  uint32_t recoveryStartMs = 0;
+  bool inWarmup;
+  uint8_t warmupDiscardRemaining;
+  uint32_t recoveryStartMs;
 
   // Contadores
-  uint32_t consecutiveFailures = 0;
-  uint32_t totalFailures = 0;
-  uint32_t totalReadsOk = 0;
+  uint32_t consecutiveFailures;
+  uint32_t totalFailures;
+  uint32_t totalReadsOk;
 
   // Offsets de giroscópio, já calibrados
-  float gxOffsetDps = 0.0f;
-  float gyOffsetDps = 0.0f;
-  float gzOffsetDps = 0.0f;
+  float gxOffsetDps;
+  float gyOffsetDps;
+  float gzOffsetDps;
 };
 
 // Offsets de gyro obtidos na sua calibração diagnóstica
 SensorState sensor1 = {
   "mpu6050",
-  "imu_upper_arm",
+  "IMU",
+  "IMU01",
   MPU_ADDR_1,
   ENABLE_SENSOR_1,
   false, false, false,
@@ -113,7 +122,8 @@ SensorState sensor1 = {
 
 SensorState sensor2 = {
   "mpu6050",
-  "imu_forearm",
+  "IMU",
+  "IMU02",
   MPU_ADDR_2,
   ENABLE_SENSOR_2,
   false, false, false,
@@ -151,12 +161,22 @@ void printBasePrefix(const char *msgType) {
   Serial.print("\"");
 }
 
+void printStreamId(const SensorState &s) {
+  Serial.print(NODE_ID);
+  Serial.print("_");
+  Serial.print(s.sensor_id);
+}
+
 void printSensorCommon(const SensorState &s) {
-  Serial.print(",\"sensor\":\"");
-  Serial.print(s.sensor_name);
+  Serial.print(",\"sensor_model\":\"");
+  Serial.print(s.sensor_model);
+  Serial.print("\",\"sensor_type\":\"");
+  Serial.print(s.sensor_type);
   Serial.print("\",\"sensor_id\":\"");
   Serial.print(s.sensor_id);
-  Serial.print("\",\"address\":\"0x");
+  Serial.print("\",\"stream_id\":\"");
+  printStreamId(s);
+  Serial.print("\",\"hw_address\":\"0x");
   if (s.addr < 16) Serial.print("0");
   Serial.print(s.addr, HEX);
   Serial.print("\"");
@@ -168,10 +188,29 @@ void sendBoot() {
   Serial.print(FW_NAME);
   Serial.print("\",\"fw_version\":\"");
   Serial.print(FW_VERSION);
-  Serial.print("\",\"board\":\"ESP32_WROOM\"");
+  Serial.print(",\"board\":\"ESP32_WROOM\"");
   Serial.print(",\"chip\":\"ESP32\"");
   Serial.print(",\"transport\":\"serial_usb\"}");
   Serial.println();
+}
+
+void printSensorEnabledField(const SensorState &s) {
+  Serial.print(",\"");
+  Serial.print(s.sensor_id);
+  Serial.print("_enabled\":");
+  Serial.print(s.enabled ? "true" : "false");
+}
+
+void printGyroOffsets(const SensorState &s) {
+  Serial.print(",\"");
+  printStreamId(s);
+  Serial.print("_gyro_offsets_dps\":{\"gx\":");
+  Serial.print(s.gxOffsetDps, 6);
+  Serial.print(",\"gy\":");
+  Serial.print(s.gyOffsetDps, 6);
+  Serial.print(",\"gz\":");
+  Serial.print(s.gzOffsetDps, 6);
+  Serial.print("}");
 }
 
 void sendConfig() {
@@ -191,6 +230,7 @@ void sendConfig() {
   Serial.print(",\"send_format\":\"ndjson\"");
   Serial.print(",\"heartbeat_interval_s\":");
   Serial.print(HEARTBEAT_INTERVAL_MS / 1000.0f, 1);
+  Serial.print(",\"node_id_standard\":\"ictaltech_sensor_identification_v1\"");
   Serial.print(",\"sensor_count\":");
   Serial.print(sensorCount);
   Serial.print(",\"recovery_delay_ms\":");
@@ -198,29 +238,15 @@ void sendConfig() {
   Serial.print(",\"warmup_samples_to_discard\":");
   Serial.print(WARMUP_SAMPLES_TO_DISCARD);
 
-  Serial.print(",\"imu_upper_arm_enabled\":");
-  Serial.print(sensor1.enabled ? "true" : "false");
-  Serial.print(",\"imu_forearm_enabled\":");
-  Serial.print(sensor2.enabled ? "true" : "false");
+  printSensorEnabledField(sensor1);
+  printSensorEnabledField(sensor2);
 
   if (sensor1.enabled) {
-    Serial.print(",\"imu_upper_arm_gyro_offsets_dps\":{\"gx\":");
-    Serial.print(sensor1.gxOffsetDps, 6);
-    Serial.print(",\"gy\":");
-    Serial.print(sensor1.gyOffsetDps, 6);
-    Serial.print(",\"gz\":");
-    Serial.print(sensor1.gzOffsetDps, 6);
-    Serial.print("}");
+    printGyroOffsets(sensor1);
   }
 
   if (sensor2.enabled) {
-    Serial.print(",\"imu_forearm_gyro_offsets_dps\":{\"gx\":");
-    Serial.print(sensor2.gxOffsetDps, 6);
-    Serial.print(",\"gy\":");
-    Serial.print(sensor2.gyOffsetDps, 6);
-    Serial.print(",\"gz\":");
-    Serial.print(sensor2.gzOffsetDps, 6);
-    Serial.print("}");
+    printGyroOffsets(sensor2);
   }
 
   Serial.print("}");
@@ -376,9 +402,17 @@ bool checkWhoAmI(uint8_t addr) {
 }
 
 bool initMPU6050(uint8_t addr) {
-  if (!writeRegister8(addr, REG_PWR_MGMT_1, 0x00)) return false;
+  // Full device reset — clears any stuck state from prior session.
+  if (!writeRegister8(addr, REG_PWR_MGMT_1, 0x80)) return false;
+  delay(100);
+
+  // PLL with X-gyro reference: stabler clock than internal 8 MHz oscillator,
+  // which on GY-521 clones causes intermittent all-zero frames.
+  if (!writeRegister8(addr, REG_PWR_MGMT_1, 0x01)) return false;
   delay(50);
 
+  if (!writeRegister8(addr, REG_SMPLRT_DIV, 0x00)) return false;   // gyro rate / 1
+  if (!writeRegister8(addr, REG_CONFIG, 0x00)) return false;       // DLPF off
   if (!writeRegister8(addr, REG_GYRO_CONFIG, 0x00)) return false;  // ±250 dps
   if (!writeRegister8(addr, REG_ACCEL_CONFIG, 0x00)) return false; // ±2g
 
@@ -426,7 +460,26 @@ void beginWarmup(SensorState &s) {
   s.healthy = false;
 }
 
+// =====================================================
+// I2C Bus reset (unsticks hung bus after failed reads)
+// =====================================================
+void resetI2CBus() {
+  // Release the bus by setting pins to input with pull-ups
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+  delay(10);
+
+  // Reinitialize Wire
+  Wire.end();
+  delay(50);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000); // 100 kHz for robustness
+}
+
 bool tryRecoverSensor(SensorState &s) {
+  // Don't tear down the shared I2C bus: the sensor still ACKs, only its
+  // internal state is bad. initMPU6050 issues a device reset, which is
+  // enough. resetI2CBus() is kept for explicit bus-fault handling only.
   if (!i2cDeviceResponds(s.addr)) return false;
   if (!initMPU6050(s.addr)) return false;
 
