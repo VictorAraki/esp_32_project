@@ -4,3 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 .venv
+.env
+include/credentials.h
